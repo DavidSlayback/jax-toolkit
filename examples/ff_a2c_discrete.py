@@ -19,16 +19,19 @@ class Agent(hk.Module):
                  name: Optional[str] = None):
         super().__init__(name=name)
         a_space = getattr(envs, 'single_action_space', envs.action_space)
-        self.n_act = a_space.n
+        self.n_act = a_space.shape or a_space.n
         o_space = getattr(envs, 'single_observation_space', envs.observation_space)
         n_obs = o_space.shape[0]
-        self.actor = MLP(layer_sizes, activation=jax.nn.tanh)
-        self.critic = MLP(layer_sizes, activation=jax.nn.tanh)
+        self.actor = hk.Sequential([MLP(layer_sizes, activation=jax.nn.tanh), CategoricalHead(int(self.n_act))])
+        self.critic = hk.Sequential([MLP(layer_sizes, activation=jax.nn.tanh), V(), jnp.squeeze])
+        # self.critic = MLP(layer_sizes, activation=jax.nn.tanh)
 
     def __call__(self, inputs: jnp.ndarray):
-        pi = CategoricalHead(self.n_act)(self.actor(inputs))
-        v = V(self.critic(inputs))
-        return pi, v.squeeze()
+        # return self.critic(inputs)
+        return self.actor(inputs), self.critic(inputs)
+        # pi = CategoricalHead(self.n_act)(self.actor(inputs))
+        # v = V(self.critic(inputs))
+        # return pi, v.squeeze()
 
 if __name__ == "__main__":
     e = gym.vector.SyncVectorEnv([partial(gym.make, 'CartPole-v1') for _ in range(B)])
@@ -40,7 +43,7 @@ if __name__ == "__main__":
     o = e.reset()
     rng = hk.PRNGSequence(0)
     net = hk.without_apply_rng(hk.transform(lambda x: Agent(e)(x)))
-    params = jax.jit(net.init)(next(rng), o[0])
+    params = jax.jit(net.init)(next(rng), o)
     for t in range(T):
         pi, v = jax.jit(net.apply)(params, o)
-        a = pi.sample()
+        a = pi.sample(seed=next(rng))

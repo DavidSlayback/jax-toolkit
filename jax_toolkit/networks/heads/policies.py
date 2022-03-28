@@ -2,6 +2,7 @@ __all__ = ['CategoricalHead', 'GaussianHeadDependentLogStd', 'GaussianHeadIndepe
 
 from typing import Sequence, Iterable, Optional, Union, Any, Callable
 
+import math
 import haiku as hk
 import jax.nn
 import jax.numpy as jnp
@@ -40,7 +41,7 @@ class CategoricalHead(hk.Module):
                  name: Optional[str] = None):
         super().__init__(name=name)
         self._shape = num_outputs
-        self._linear = hk.Linear(jnp.prod(num_outputs), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
+        self._linear = hk.Linear(int(onp.prod(num_outputs)), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
 
     def __call__(self, inputs: jnp.ndarray, indices: Optional[jnp.ndarray] = None) -> Categorical:
         """Sub-select using indices (e.g., options)"""
@@ -63,7 +64,7 @@ class GaussianHeadDependentLogStd(hk.Module):
                  name: Optional[str] = None):
         super().__init__(name=name)
         self._shape = num_outputs
-        self._linear = hk.Linear(2 * onp.prod(num_outputs), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
+        self._linear = hk.Linear(int(2 * onp.prod(num_outputs)), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
 
     def __call__(self, inputs: jnp.ndarray, indices: Optional[jnp.ndarray] = None) -> Gaussian:
         """Sub-select using indices (e.g., options)"""
@@ -87,8 +88,8 @@ class GaussianHeadIndependentLogStd(hk.Module):
                  name: Optional[str] = None):
         super().__init__(name=name)
         self._shape = num_outputs
-        self._linear = hk.Linear(onp.prod(num_outputs), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
-        self._log_std = hk.get_parameter('log_std', (onp.prod(num_outputs),), init=jnp.zeros)
+        self._linear = hk.Linear(int(onp.prod(num_outputs)), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
+        self._log_std = hk.get_parameter('log_std', (int(onp.prod(num_outputs)),), init=jnp.zeros)
 
     def __call__(self, inputs: jnp.ndarray, indices: Optional[jnp.ndarray] = None) -> Gaussian:
         """Sub-select using indices (e.g., options)"""
@@ -113,7 +114,7 @@ class BetaHead(hk.Module):
                  name: Optional[str] = None):
         super().__init__(name=name)
         self._shape = num_outputs
-        self._linear = hk.Sequential([hk.Linear(2 * onp.prod(num_outputs), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros),
+        self._linear = hk.Sequential([hk.Linear(int(2 * onp.prod(num_outputs)), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros),
                                       jax.nn.softplus])
 
     def __call__(self, inputs: jnp.ndarray, indices: Optional[jnp.ndarray] = None) -> Beta:
@@ -140,7 +141,7 @@ class TerminationHead(hk.Module):
         super().__init__(name=name)
         self._shape = num_outputs
         self._temp = temperature
-        self._linear = hk.Linear(onp.prod(num_outputs), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
+        self._linear = hk.Linear(int(onp.prod(num_outputs)), w_init=get_orthogonal_activation('pi'), b_init=jnp.zeros)
 
     def __call__(self, inputs: jnp.ndarray, indices: Optional[jnp.ndarray] = None) -> Bernoulli:
         """Sub-select using indices (e.g., options)"""
