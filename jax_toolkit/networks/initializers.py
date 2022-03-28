@@ -17,8 +17,8 @@ ORTHOGONAL_INIT_VALUES: Dict[str, float] = {
 
 def get_orthogonal_activation_std(activation_fn: Union[str, Callable]) -> float:
     """Get appropriate initialization value for given activation function (or string name of one)"""
-    name = activation_fn.__name__ if isinstance(activation_fn, Callable) else activation_fn
-    if name in ORTHOGONAL_INIT_VALUES.keys(): return ORTHOGONAL_INIT_VALUES[activation_fn.__name__]
+    name = activation_fn if isinstance(activation_fn, str) else activation_fn.__name__
+    if name in ORTHOGONAL_INIT_VALUES.keys(): return ORTHOGONAL_INIT_VALUES[name]
     else: return ORTHOGONAL_INIT_VALUES['relu']  # ReLU default
 
 
