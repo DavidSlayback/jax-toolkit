@@ -10,5 +10,6 @@ tfb = tfp.bijectors
 Distribution = tfd.Distribution
 Categorical = tfd.Categorical
 Beta = tfd.Beta
-Gaussian = tfd.Normal
+Gaussian = tfd.MultivariateNormalDiag
+SquashedGaussian = lambda *args, **kwargs: tfd.TransformedDistribution(distribution=Gaussian(*args, **kwargs), bijector=tfb.Tanh())  # Tanh squashed gaussian
 Bernoulli = tfd.Bernoulli
