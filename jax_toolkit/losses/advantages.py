@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-__all__ = ['compute_gae']
+__all__ = ['compute_gae', 'termination_advantage']
 """Proximal policy optimization training.
 
 See: https://arxiv.org/pdf/1707.06347.pdf
@@ -24,6 +24,7 @@ import rlax
 
 Array = chex.Array
 Numeric = chex.Numeric
+Scalar = chex.Scalar
 
 
 def compute_gae(
@@ -56,6 +57,30 @@ def compute_gae(
                                 jax.lax.stop_gradient(target_tm1), target_tm1)
     return target_tm1 - v_tm1, target_tm1
 
+
+def termination_advantage(
+        q_t_w_tm1: Array,
+        v_t: Array,
+        discount_t: Array,
+        deliberation_cost: Scalar
+) -> Array:
+    """Calculates termination advantage
+
+    Advantage of terminating option w_tm1 at state s_t
+    Q(s', w) - v(s') + eta
+
+    Args:
+        q_t_w_tm1: Q-value of previous option in new state
+        v_t: Value of overall policy in new state
+        discount_t: Mask applied
+        deliberation_cost: Extra cost incurred for switching options
+    Returns:
+         Termination advantage
+    """
+    chex.assert_rank([q_t_w_tm1, v_t, discount_t], [1, 1, 1])
+    chex.assert_type([q_t_w_tm1, v_t, discount_t, deliberation_cost], float)
+    return (q_t_w_tm1 - v_t + deliberation_cost) * discount_t
+    ...
 
 # def compute_gae(truncation: jnp.ndarray,
 #                 termination: jnp.ndarray,
