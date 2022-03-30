@@ -9,6 +9,7 @@ import warnings
 from distutils.util import strtobool
 from typing import Optional, Tuple, Dict, Sequence, NamedTuple, Union
 
+import brax
 import psutil
 import wandb
 from wandb.util import generate_id
@@ -28,6 +29,8 @@ import optax
 from jax_toolkit.networks.rnn.gru import get_gru_cls_or_fake, get_gru_cls
 from jax_toolkit.networks.bodies.mlp import MLP
 from jax_toolkit.networks.heads import *
+from jax_toolkit.utils.normalization import create_observation_normalizer, NormParams
+from jax_toolkit.losses.advantages import compute_gae
 import chex
 
 BASE_PATH = pathlib.Path(__file__).parent
@@ -45,23 +48,6 @@ class ACObs(NamedTuple):
 class ACOutput(NamedTuple):
     policy: Distribution
     value: jnp.ndarray
-
-
-class UnrollOutput(NamedTuple):
-    logprobs: jnp.ndarray
-    entropy: jnp.ndarray
-    value: jnp.ndarray
-    ...
-
-
-@chex.dataclass
-class StepData:
-    obs: jnp.ndarray
-    rewards: jnp.ndarray
-    dones: jnp.ndarray
-    truncation: jnp.ndarray
-    actions: jnp.ndarray
-    logits: jnp.ndarray
 
 
 def _core_input(inputs: ACObs) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -91,11 +77,16 @@ class ActorCritic(hk.RNNCore):
     def __call__(self, inputs: ACObs, state: GRUState) -> Tuple[ACOutput, GRUState]:
         """One step, B dim"""
         inputs = jax.tree_map(lambda t: t[None, ...], inputs)  # Add T dimension
-        out, state = self.unroll(jax.tree_map(lambda t: t[None, ...], inputs), state)  # Add T dimension)
+        out, state = self.unroll(jax.tree_map(lambda t: t[None, ...], inputs), state)  # Add T dimension, state doesn't need it
         return jax.tree_map(lambda t: jnp.squeeze(t, 0), out), state
         # f, state = self.shared(_core_input(inputs), state)
         # pi, v = self._head(f)
         # return ACOutput(pi, v), state
+
+    def step(self, inputs: ACObs, state: GRUState):
+        """One step, just actor"""
+        out, state = self.shared(_core_input(inputs), state)
+        return self.actor(out), state
 
     def unroll(self, inputs: ACObs, state: GRUState):
         """Sequence of steps, T,B dim"""
@@ -103,9 +94,6 @@ class ActorCritic(hk.RNNCore):
         else: f, state = hk.BatchApply(self.shared)(_core_input(inputs), state)
         pi, v = hk.BatchApply(self._head)(f)
         return ACOutput(pi, v), state
-        # lp = pi.log_prob(action)
-        # entropy = pi.entropy()
-        # return UnrollOutput(lp, entropy, v)
 
     def initial_state(self, batch_size: Optional[int]):
         return self.shared.initial_state(batch_size)
@@ -114,8 +102,10 @@ class ActorCritic(hk.RNNCore):
 def make_models(envs, args):
     # Initial state may require parameters if learnable
     initial_state_init, initial_state = hk.without_apply_rng(hk.transform(lambda b: ActorCritic(envs, args).initial_state(b)))
-    init, step = hk.without_apply_rng(hk.transform(lambda i, state: ActorCritic(envs, args)(i, state)))
-    _, unroll = hk.without_apply_rng(hk.transform(lambda i, state, a: ActorCritic(envs, args).unroll(i, state, a)))
+    _, step = hk.without_apply_rng(hk.transform(lambda i, state: ActorCritic(envs, args).step(i, state)))
+    init, unroll = hk.without_apply_rng(hk.transform(lambda i, state: ActorCritic(envs, args).unroll(i, state)))
+    # init, step = hk.without_apply_rng(hk.transform(lambda i, state: ActorCritic(envs, args)(i, state)))
+    # _, unroll = hk.without_apply_rng(hk.transform(lambda i, state, a: ActorCritic(envs, args).unroll(i, state, a)))
     return init, (initial_state_init, initial_state), (step, unroll)
 
 
@@ -206,8 +196,6 @@ def parse_args():
         help='the number of steps to run in each environment per policy rollout')
     parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-        help='Use GAE for advantage computation')
     parser.add_argument('--gamma', type=float, default=0.99,
         help='the discount factor gamma')
     parser.add_argument('--gae-lambda', type=float, default=0.95,
@@ -286,60 +274,78 @@ if __name__ == "__main__":
         envs, eval_envs = make_envs(args, run_name)
         next_obs = envs.reset()
         next_done = envs._state.done
-        a = envs.action_space.sample()
+        action = envs.action_space.sample()
         rng = hk.PRNGSequence(args.seed)
 
         # Create model
-        init, (state_init, state_create), (apply, unroll) = make_models(envs, args)
+        init, (state_init, state_create), (act, unroll) = make_models(envs, args)
         state_params = state_init(next(rng), args.num_envs)  # Only really need these once...could I just do a jnp.zeros?
         state = state_create(state_params, args.num_envs)
 
-        params = jax.jit(init, backend=backend)(next(rng), ACObs(next_obs, a, next_done), state)
+        # params = init(next(rng), ACObs(next_obs, a, next_done), state)
+        tobs = ACObs(next_obs[None, ...], action[None, ...], next_done[None,...])
+        params = jax.jit(init, backend=backend)(next(rng), tobs, state)
+        act = jax.jit(act, backend=backend)
+        unroll = jax.jit(unroll, backend=backend)
+        # test = jax.jit(step, backend=backend)(params, ACObs(next_obs, a, next_done), state)
+        # test2 = jax.jit(unroll, backend=backend)(params, ACObs(next_obs[None, ...], a[None, ...], next_done[None, ...]), state)
 
         # Create optimizer
         num_updates = args.total_timesteps // args.batch_size
         schedule = optax.linear_schedule(1., 0., num_updates) if args.anneal_lr else optax.constant_schedule(1.)
-        optimizer = optax.chain(optax.adam(args.learning_rate), optax.scale_by_schedule(schedule))
+        optimizer = optax.chain(optax.adam(args.learning_rate), optax.scale_by_schedule(schedule), optax.clip_by_global_norm(args.max_grad_norm))
         opt_params = optimizer.init(params)
 
         # Entropy
         final_ent = args.ent_coef * args.ent_coef_final_fraction if args.ent_coef_steps else args.ent_coef
         entropy_schedule = optax.linear_schedule(args.ent_coef, final_ent, num_updates)
 
-        # ALGO Logic: Storage setup
+        # Observation normalization
+        norm_params, norm_update_fn, norm_apply_fn = create_observation_normalizer(next_obs.shape[-1], num_leading_batch_dims=2)
+
+        # Action scaling
+
+
+        @partial(jax.jit, backend=backend)
+        def sample_step(o, a, d, state, n_params, p_params, key):
+            obs = ACObs(norm_apply_fn(n_params, o), a, d)
+            pi, state = act(p_params, obs, state)
+            return pi.sample(seed=key), state
+
+        @partial(jax.jit, backend=backend)
+        def update_norm_and_unroll(o, a, d, state, n_params, p_params):
+            n_params = norm_update_fn(n_params, o[:-1])
+            obs = ACObs(norm_apply_fn(n_params, o), a, d)
+            return unroll(p_params, obs, state)[0], n_params
+
+        gae = jax.jit(jax.vmap(compute_gae, in_axes=(0, 0, 0, 0, None)), backend=backend)
+
 
         # TRY NOT TO MODIFY: start the game
         global_step = 0
         start_time = time.time()
         for update in range(1, num_updates + 1):
+            initial_state = state
+            obs = [next_obs]; actions = [action]; rewards = []; dones = [next_done]
             ent_coef = entropy_schedule(global_step)  # Entropy schedule
+            keys = jax.random.split(next(rng), args.num_steps)
+            # keys = hk.reserve_rng_keys(args.num_steps)  # Reserve random keys for action sampling
 
             for step in range(0, args.num_steps):
-                obs[step] = next_obs
                 global_step += 1 * args.num_envs
-                dones[step] = next_done
-
-                # ALGO LOGIC: action logic
-                state = agent.get_state(obs[step], state, next_done, prev_actions[step])
-                actions[step], logprobs[step], entropies[step], values[step] = agent.get_action_and_value(state)
-
-                # TRY NOT TO MODIFY: execute the game and log data.
-                next_obs, rewards[step], next_done, info = envs.step(actions[step])
+                action, state = sample_step(obs[-1], actions[-1], dones[-1], state, norm_params, params, keys[step])
+                next_obs, r, next_done, info = envs.step(action)
+                actions.append(action); obs.append(next_obs); rewards.append(r * args.reward_scale); dones.append(next_done)
 
             # bootstrap value if not done
-            rewards *= args.reward_scale  # Scale rewards
-            next_value = agent.get_value(agent.get_state(next_obs.float(), state, next_done, actions[-1])).reshape(1, -1)
-            mask = discount_mask(torch.cat((dones[1:], next_done.unsqueeze(0)), 0), args.gamma)
-            if args.gae:
-                advantages, returns = gae(torch.cat((values, next_value), 0), rewards, mask, args.gae_lambda)
-            else:
-                returns = lambda_return(next_value.unsqueeze(0), rewards, mask)
-                advantages = returns - values
-            # if args.norm_adv: advantages = normalize(advantages)
+            o, a, r, d = (jnp.stack(_) for _ in (obs, actions, rewards, dones))
+            (pi, v), norm_params = update_norm_and_unroll(o, a, d, initial_state, norm_params, params)
+            discount_mask = (1. - d[1:]) * args.gamma
+            advantages, returns = gae(v[:-1], r, discount_mask, v[1:], args.gae_lambda)
+            if args.norm_adv: advantages = jax.nn.normalize(advantages)
 
             # Policy loss
             b_inds = np.arange(args.num_envs)
-            if args.normalize_obs: agent.update_normalizer(obs)
             for epoch in range(args.update_epochs):
                 np.random.shuffle(b_inds)
                 for start in range(0, args.num_envs, args.minibatch_size):
