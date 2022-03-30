@@ -318,7 +318,7 @@ if __name__ == "__main__":
             obs = ACObs(norm_apply_fn(n_params, o), a, d)
             return unroll(p_params, obs, state)[0], n_params
 
-        gae = jax.jit(jax.vmap(compute_gae, in_axes=(0, 0, 0, 0, None)), backend=backend)
+        gae = jax.jit(jax.vmap(partial(compute_gae, lambda_=args.gae_lambda)), backend=backend)
 
 
         # TRY NOT TO MODIFY: start the game
@@ -341,7 +341,7 @@ if __name__ == "__main__":
             o, a, r, d = (jnp.stack(_) for _ in (obs, actions, rewards, dones))
             (pi, v), norm_params = update_norm_and_unroll(o, a, d, initial_state, norm_params, params)
             discount_mask = (1. - d[1:]) * args.gamma
-            advantages, returns = gae(v[:-1], r, discount_mask, v[1:], args.gae_lambda)
+            advantages, returns = gae(v[:-1], r, discount_mask, v[1:])
             if args.norm_adv: advantages = jax.nn.normalize(advantages)
 
             # Policy loss
