@@ -1,4 +1,4 @@
-__all__ = ['CategoricalHead', 'GaussianHeadDependentLogStd', 'GaussianHeadIndependentLogStd', 'BetaHead']
+__all__ = ['CategoricalHead', 'GaussianHeadDependentLogStd', 'GaussianHeadIndependentLogStd', 'BetaHead', 'TerminationHead']
 
 from typing import Sequence, Iterable, Optional, Union, Any, Callable
 

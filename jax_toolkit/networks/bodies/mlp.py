@@ -21,7 +21,7 @@ class MLP(hk.nets.MLP):
             activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.relu,
             activate_final: bool = False,
             name: Optional[str] = None,
-            orthogonal_initialization: bool = False
+            orthogonal_initialization: bool = True
     ):
         w_init = get_orthogonal_activation(activation) if orthogonal_initialization else w_init
         b_init = jnp.zeros if (with_bias and orthogonal_initialization) else b_init

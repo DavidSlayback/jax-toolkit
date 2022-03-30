@@ -66,7 +66,7 @@ def get_gru_cls(ln: bool = False, learnable: bool = False, orthogonal_init: bool
 def get_gru_cls_or_fake(recurrent: bool = True, ln: bool = False, learnable: bool = False, orthogonal_init: bool = True) -> Callable:
     """Either get appropriate GRU class or a Linear layer that behaves similarly"""
     if recurrent: return get_gru_cls(ln, learnable, orthogonal_init)
-    class FakeGRU(hk.Module):
+    class FakeGRU(hk.IdentityCore):
         def __init__(self, hidden_size: int,
                      w_i_init: Optional[hk.initializers.Initializer] = get_orthogonal_activation('tanh') if orthogonal_init else None,
                      w_h_init: Optional[hk.initializers.Initializer] = None,
@@ -82,4 +82,5 @@ def get_gru_cls_or_fake(recurrent: bool = True, ln: bool = False, learnable: boo
             if self._ln: out = hk.LayerNorm(-1, True, True)(out)
             out = jax.nn.tanh(out)
             return out, out
+
     return FakeGRU
