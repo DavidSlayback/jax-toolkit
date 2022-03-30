@@ -109,6 +109,52 @@ def make_models(envs, args):
     return init, (initial_state_init, initial_state), (step, unroll)
 
 
+class Agent:
+    def __init__(self, envs, args):
+        self.backend = 'gpu' if (args.cuda and jax.default_backend() == 'gpu') else 'cpu'
+        self._init, (self._state_param, self._get_state), (self._step, self._unroll) = make_models(envs, args)
+        self._dummy_x = ACObs(envs.observation_space.sample(), envs.action_space.sample(), jnp.zeros((args.num_envs,)))
+        self._n_params, self._norm_update, self._norm_apply = create_observation_normalizer(self._dummy_x.o.shape[-1], args.normalize_obs, num_leading_batch_dims=2)
+        # Learning parameters
+        self._gamma = args.gamma  # Discount
+        self._gae = jax.vmap(partial(compute_gae, lambda_=args.gae_lambda))  # Lambda-returns and advantages
+        def _loss(params: hk.Params, trajectories):
+
+
+    @partial(jax.jit, static_argnums=(0, 1))
+    def initial_state(self, batch_size: Optional[int]) -> GRUState:
+        """Get starting hidden state"""
+        p = self._state_param(None)
+        return self._get_state(p, batch_size)
+
+    @partial(jax.jit, static_argnums=0)
+    def initial_network_params(self, rng: jnp.ndarray, state: GRUState):
+        """Get initial model parameters"""
+        return self._init(rng, jax.tree_map(lambda x: x[None, ...], self._dummy_x), state)
+
+    def initial_norm_params(self):
+        """Initial observation normalizer parameters"""
+        return self._n_params
+
+    @partial(jax.jit, static_argnums=0)
+    def step(self, rng: jnp.ndarray, params: hk.Params, n_params: NormParams, obs: ACObs, state: GRUState):
+        """Take one step, get action and state"""
+        obs = obs._replace(o=self._norm_apply(n_params, obs.o))
+        pi, state = self._step(params, obs, state)
+        action = pi.sample(seed=rng)
+        return action, state
+
+    def loss(self):
+        ...
+
+
+
+
+
+
+
+
+
 def make_envs(args, run_name: str):
     seed = args.seed
     random.seed(seed)
@@ -279,7 +325,7 @@ if __name__ == "__main__":
 
         # Create model
         init, (state_init, state_create), (act, unroll) = make_models(envs, args)
-        state_params = state_init(next(rng), args.num_envs)  # Only really need these once...could I just do a jnp.zeros?
+        state_params = state_init(None, args.num_envs)  # Only really need these once...could I just do a jnp.zeros?
         state = state_create(state_params, args.num_envs)
 
         # params = init(next(rng), ACObs(next_obs, a, next_done), state)
