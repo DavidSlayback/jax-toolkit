@@ -11,6 +11,7 @@ from typing import Optional, Tuple, Dict, Sequence, NamedTuple, Union, Callable
 
 import brax
 import psutil
+import rlax
 import wandb
 from wandb.util import generate_id
 
@@ -31,6 +32,7 @@ from jax_toolkit.networks.bodies.mlp import MLP
 from jax_toolkit.networks.heads import *
 from jax_toolkit.utils.normalization import create_observation_normalizer, NormParams
 from jax_toolkit.losses.advantages import compute_gae
+from jax_toolkit.losses import entropy_loss, kl_loss, value_loss, unclipped_ppo_loss
 import chex
 
 BASE_PATH = pathlib.Path(__file__).parent
@@ -92,7 +94,9 @@ class ActorCritic(hk.RNNCore):
         """Sequence of steps, T,B dim"""
         if self._recurrent: f, state = hk.dynamic_unroll(self.shared, _core_input(inputs), state)
         else: f, state = hk.BatchApply(self.shared)(_core_input(inputs), state)
-        pi, v = hk.BatchApply(self._head)(f)
+        pi = hk.BatchApply(self.actor)(f[:-1])
+        v = hk.BatchApply(self.critic)(f)
+        # pi, v = hk.BatchApply(self._head)(f)
         return ACOutput(pi, v), state
 
     def initial_state(self, batch_size: Optional[int]):
@@ -109,128 +113,13 @@ def make_models(envs, args):
     return init, (initial_state_init, initial_state), (step, unroll)
 
 
-@chex.dataclass
-class TrainingState:
-    """Convenience class for parameter state"""
-    step: int
-    opt_state: optax.OptState
-    params: hk.Params
-    norm_params: NormParams
-    unroll: Callable
-    tx: optax.GradientTransformation
-
-    def apply_gradients(self, *, grads, **kwargs):
-        """Updates `step`, `params`, `opt_state` and `**kwargs` in return value.
-
-        Note that internally this function calls `.tx.update()` followed by a call
-        to `optax.apply_updates()` to update `params` and `opt_state`.
-
-        Args:
-          grads: Gradients that have the same pytree structure as `.params`.
-          **kwargs: Additional dataclass attributes that should be `.replace()`-ed.
-
-        Returns:
-          An updated instance of `self` with `step` incremented by one, `params`
-          and `opt_state` updated by applying `grads`, and additional attributes
-          replaced as specified by `kwargs`.
-        """
-        updates, new_opt_state = self.tx.update(grads, self.opt_state, self.params)
-        new_params = optax.apply_updates(self.params, updates)
-        return self.replace(
-            step=self.step + 1,
-            params=new_params,
-            opt_state=new_opt_state,
-            **kwargs,
-        )
-
-    @classmethod
-    def create(cls, *, unroll, params, norm_params, tx, **kwargs):
-        """Creates a new instance with `step=0` and initialized `opt_state`."""
-        opt_state = tx.init(params)
-        return cls(
-            step=0,
-            unroll=unroll,
-            params=params,
-            norm_params=norm_params,
-            tx=tx,
-            opt_state=opt_state,
-            **kwargs,
-        )
-
-
-class Agent:
-    def __init__(self, envs, args):
-        self.args = args
-        self.backend = 'gpu' if (args.cuda and jax.default_backend() == 'gpu') else 'cpu'
-        self._b_size = envs.num_envs
-        self._init, (self._state_param, self._get_state), (self._step, self._unroll) = make_models(envs, args)
-        self._dummy_x = ACObs(envs.observation_space.sample(), envs.action_space.sample(), jnp.zeros((args.num_envs,)))
-        self._n_params, self._norm_update, self._norm_apply = create_observation_normalizer(self._dummy_x.o.shape[-1], args.normalize_obs, num_leading_batch_dims=2)
-        # Learning parameters
-        self._gamma = args.gamma  # Discount
-        self._gae = jax.vmap(partial(compute_gae, lambda_=args.gae_lambda))  # Lambda-returns and advantages
-        num_updates = args.total_timesteps // args.batch_size
-        schedule = optax.linear_schedule(1., 0., num_updates) if args.anneal_lr else optax.constant_schedule(1.)
-        self._opt = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adam(args.learning_rate), optax.scale_by_schedule(schedule))
-
-        def _loss(params: hk.Params, trajectories):
-
-
-    @partial(jax.jit, static_argnums=(0, 1))
-    def initial_state(self, batch_size: Optional[int]) -> GRUState:
-        """Get starting hidden state"""
-        p = self._state_param(None)
-        return self._get_state(p, batch_size)
-
-    @partial(jax.jit, static_argnums=0)
-    def initial_network_params(self, rng: jnp.ndarray, state: GRUState):
-        """Get initial model parameters"""
-        return self._init(rng, jax.tree_map(lambda x: x[None, ...], self._dummy_x), state)
-
-    def initial_norm_params(self):
-        """Initial observation normalizer parameters"""
-        return self._n_params
-
-    def initial_training_state(self, rng: jnp.ndarray) -> TrainingState:
-        return TrainingState.create(unroll=self._unroll,
-                                    params=self.initial_network_params(rng, self._dummy_x, jnp.zeros(self._b_size)),
-                                    norm_params=self._n_params,
-                                    tx=self._opt)
-
-
-    @partial(jax.jit, static_argnums=0)
-    def step(self, rng: jnp.ndarray, params: hk.Params, n_params: NormParams, obs: ACObs, state: GRUState):
-        """Take one step, get action and state"""
-        obs = obs._replace(o=self._norm_apply(n_params, obs.o))
-        pi, state = self._step(params, obs, state)
-        action = pi.sample(seed=rng)
-        return action, state
-
-    def loss(self):
-        ...
-
-    @partial(jax.jit, static_argnums=0)
-    def update(self, t):
-
-
-
-
-
-
-
-
-
 def make_envs(args, run_name: str):
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     # use the gym environment for convenience
     env = create_gym_env(args.gym_id, args.num_envs, args.seed, 'gpu' if args.cuda else 'cpu', action_repeat=args.frame_skip, episode_length=args.time_limit)
-    eval_env = create_gym_env(args.gym_id, args.num_eval_envs, args.seed+1, 'gpu' if args.cuda else 'cpu', action_repeat=args.frame_skip, episode_length=args.time_limit, eval_metrics=True)
-    # # Step through batch of environments randomly to decorrelate and generate some statistics upfront
-    # o = env.reset()
-    # for t in range(200):
-    #     o = env.step(env.action_space.sample())[0]
+    eval_env = create_gym_env(args.gym_id, args.num_eval_envs, args.seed+1, 'gpu' if args.cuda else 'cpu', action_repeat=args.frame_skip, episode_length=args.time_limit, eval_metrics=True, discount=args.gamma)
     return env, eval_env, # o
 
 
@@ -389,6 +278,7 @@ if __name__ == "__main__":
         rng = hk.PRNGSequence(args.seed)
 
         # Create model
+        # agent = Agent(envs, args)
         init, (state_init, state_create), (act, unroll) = make_models(envs, args)
         state_params = state_init(None, args.num_envs)  # Only really need these once...could I just do a jnp.zeros?
         state = state_create(state_params, args.num_envs)
@@ -396,7 +286,7 @@ if __name__ == "__main__":
         # params = init(next(rng), ACObs(next_obs, a, next_done), state)
         tobs = ACObs(next_obs[None, ...], action[None, ...], next_done[None,...])
         params = jax.jit(init, backend=backend)(next(rng), tobs, state)
-        act = jax.jit(act, backend=backend)
+        # act = jax.jit(act, backend=backend)
         unroll = jax.jit(unroll, backend=backend)
         # test = jax.jit(step, backend=backend)(params, ACObs(next_obs, a, next_done), state)
         # test2 = jax.jit(unroll, backend=backend)(params, ACObs(next_obs[None, ...], a[None, ...], next_done[None, ...]), state)
@@ -415,20 +305,79 @@ if __name__ == "__main__":
         norm_params, norm_update_fn, norm_apply_fn = create_observation_normalizer(next_obs.shape[-1], num_leading_batch_dims=2)
 
         # Action scaling
+        a_scale, inv_a_scale = get_action_scale_fns(envs.single_action_space, from_beta=args.policy_param=='beta', apply_tanh=not args.policy_param=='beta')
 
 
         @partial(jax.jit, backend=backend)
         def sample_step(o, a, d, state, n_params, p_params, key):
+            """One step, get scaled action, actual sample, and state"""
             obs = ACObs(norm_apply_fn(n_params, o), a, d)
             pi, state = act(p_params, obs, state)
-            return pi.sample(seed=key), state
+            a = pi.sample(seed=key)
+            return a_scale(a), a, state
 
         @partial(jax.jit, backend=backend)
-        def update_norm_and_unroll(o, a, d, state, n_params, p_params):
-            n_params = norm_update_fn(n_params, o[:-1])
-            obs = ACObs(norm_apply_fn(n_params, o), a, d)
-            return unroll(p_params, obs, state)[0], n_params
+        def update_norm_and_unroll(o, p_a, a, d, state, n_params, p_params):
+            """Multi-step, get old log probs, update normalization parameters
 
+            Called after rollout
+            Returns:
+                old_log_prob
+                normalized obs
+                normalizer parameters
+            """
+            n_params = norm_update_fn(n_params, o[:-1])
+            o = norm_apply_fn(n_params, o)
+            obs = ACObs(norm_apply_fn(n_params, o), p_a, d)
+            pi, v = unroll(p_params, obs, state)[0]
+            return (pi.log_prob(a).sum(-1), v), o, n_params
+
+
+        # @partial(jax.jit, backend=backend)
+        def loss(p_params: hk.Params, o, p_a, a, d, initial_state, adv, ret, lp_old, vf_coef: float, ent_coef: float, kl_coef: float):
+            """Loss on one minibatch of one epoch"""
+            if args.norm_adv: adv = jax.nn.normalize(adv)
+            obs = ACObs(o, p_a, d)
+            pi, v = unroll(p_params, obs, initial_state)[0]
+            lp = pi.log_prob(a).sum(-1)
+            logratio = lp - lp_old
+            ratio = jnp.exp(logratio)
+            pi_loss = jnp.mean(jax.vmap(unclipped_ppo_loss)(ratio, adv))
+            kl_penalty = kl_loss(ratio)
+            ent = pi.entropy().sum(-1)
+            ent_loss = entropy_loss(ent)
+            vf_loss = value_loss(ret, v[:-1])
+            total_loss = pi_loss + (vf_loss * vf_coef) + (ent_loss * ent_coef) + (kl_penalty * kl_coef)
+            return total_loss, {'total_loss': total_loss,
+                                'vf_loss': vf_loss,
+                                'pi_loss': pi_loss,
+                                'ent_loss': ent_loss,
+                                'kl_loss': kl_penalty}
+
+        @partial(jax.jit, backend=backend, static_argnames=('vf_coef', 'kl_coef'))
+        def update_one_epoch(p_params: hk.Params, opt_params: optax.OptState, b_idxes, o, p_a, a, d, initial_state, adv, ret, lp_old, vf_coef: float, ent_coef: float, kl_coef: float):
+            """Update using randomly sampled indices"""
+            total_loss = ()
+            for b_ind in b_idxes:
+                total_loss, grads = jax.value_and_grad(loss, has_aux=True)(
+                    p_params,
+                    o=o[:, b_ind],
+                    p_a=p_a[:, b_ind],
+                    a=a[:, b_ind],
+                    d=d[:, b_ind],
+                    initial_state=initial_state[b_ind],
+                    adv=adv[:, b_ind],
+                    ret=ret[:, b_ind],
+                    lp_old=lp_old[:, b_ind],
+                    vf_coef=vf_coef,
+                    ent_coef=ent_coef,
+                    kl_coef=kl_coef
+                )
+                updates, opt_params = optimizer.update(grads, opt_params, p_params)
+                p_params = optax.apply_updates(p_params, updates)
+            return p_params, opt_params, total_loss
+
+        # Generalized advantage estimation
         gae = jax.jit(jax.vmap(partial(compute_gae, lambda_=args.gae_lambda)), backend=backend)
 
 
@@ -437,100 +386,62 @@ if __name__ == "__main__":
         start_time = time.time()
         for update in range(1, num_updates + 1):
             initial_state = state
-            obs = [next_obs]; actions = [action]; rewards = []; dones = [next_done]
+            obs = [next_obs]; prev_actions = [action]; rewards = []; dones = [next_done]; actions = []
             ent_coef = entropy_schedule(global_step)  # Entropy schedule
-            keys = jax.random.split(next(rng), args.num_steps)
-            # keys = hk.reserve_rng_keys(args.num_steps)  # Reserve random keys for action sampling
-
+            keys = jax.random.split(next(rng), args.num_steps)  # Reserve random keys for action sampling
             for step in range(0, args.num_steps):
                 global_step += 1 * args.num_envs
-                action, state = sample_step(obs[-1], actions[-1], dones[-1], state, norm_params, params, keys[step])
-                next_obs, r, next_done, info = envs.step(action)
-                actions.append(action); obs.append(next_obs); rewards.append(r * args.reward_scale); dones.append(next_done)
+                scaled_action, action, state = sample_step(obs[-1], prev_actions[-1], dones[-1], state, norm_params, params, keys[step])
+                next_obs, r, next_done, info = envs.step(scaled_action)
+                prev_actions.append(scaled_action); actions.append(action); obs.append(next_obs); rewards.append(r * args.reward_scale); dones.append(next_done)
 
             # bootstrap value if not done
-            o, a, r, d = (jnp.stack(_) for _ in (obs, actions, rewards, dones))
-            (pi, v), norm_params = update_norm_and_unroll(o, a, d, initial_state, norm_params, params)
+            o, p_a, a, r, d = (jnp.stack(_) for _ in (obs, prev_actions, actions, rewards, dones))
+            (old_lp, v), o, norm_params = update_norm_and_unroll(o, p_a, a, d, initial_state, norm_params, params)  # o is now normalized
             discount_mask = (1. - d[1:]) * args.gamma
             advantages, returns = gae(v[:-1], r, discount_mask, v[1:])
-            if args.norm_adv: advantages = jax.nn.normalize(advantages)
 
-            # Policy loss
+            # Policy loss. Shuffle trajectories only (not timesteps)
             b_inds = np.arange(args.num_envs)
             for epoch in range(args.update_epochs):
                 np.random.shuffle(b_inds)
-                for start in range(0, args.num_envs, args.minibatch_size):
-                    end = start + args.minibatch_size
-                    mb_inds = b_inds[start:end]
+                mb_inds = np.split(b_inds, args.num_minibatches)
+                params, opt_params, total_loss = update_one_epoch(params, opt_params, mb_inds, o, p_a, a, d, initial_state, advantages, returns, old_lp, args.vf_coef, entropy_schedule(update), args.kl_coef)
 
-                    _, newlogprob, entropy, newvalue = agent.unroll(obs[:, mb_inds], initial_state[mb_inds], dones[:, mb_inds], prev_actions[:, mb_inds], actions[:, mb_inds])
-                    logratio = newlogprob - logprobs[:, mb_inds].view(-1)
-                    ratio = logratio.exp()
-
-                    mb_advantages = advantages[:, mb_inds].view(-1)
-                    if args.norm_adv: mb_advantages = normalize(mb_advantages)
-
-                    # Policy loss
-                    surr_loss = (-mb_advantages * ratio).mean()
-                    kl_penalty = (ratio * logratio).mean()
-                    # pg_loss1 = -mb_advantages * ratio
-                    # pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                    # pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                    # Value loss
-                    newvalue = newvalue.view(-1)
-                    v_loss = 0.5 * ((newvalue - returns[:, mb_inds].view(-1)) ** 2).mean()
-
-                    entropy_loss = entropy.mean()
-                    loss = surr_loss - args.ent_coef * entropy_loss + args.kl_coef * kl_penalty + v_loss * args.vf_coef
-
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                    optimizer.step()
-
+            base_logs = {'global_step': global_step}
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            base_logs = {
-                "charts/mean_episodic_return": np.nanmean(envs.return_queue),
-                "charts/mean_episodic_length": np.nanmean(envs.length_queue),
-                "charts/mean_discounted_episodic_return": np.nanmean(envs.discounted_return_queue),
-                "global_step": global_step,
-            }
+            if ((update-1) % args.log_frequency) == 0:
+                o_e, a_e, d_e = eval_envs.reset(), jnp.zeros_like(action), jnp.zeros_like(next_done)
+                e_state = state_create(params, args.num_eval_envs)
+                e_keys = jax.random.split(next(rng), args.time_limit)
+                for t in range(args.time_limit):
+                    a_e, _, state = sample_step(o_e, a_e, d_e, e_state, norm_params, params, keys[t])
+                    o_e, _, d_e, _ = eval_envs.step(a_e)
+                base_logs |= eval_envs.get_stats()
             if args.verbose:
-                y_pred, y_true = values.detach().cpu().numpy(), returns.detach().cpu().numpy()
+                base_logs |= {
+                    f"charts/{l}": np.array(v) for l, v in total_loss[-1].items()
+                }
+                y_pred, y_true = np.array(v[:-1]), np.array(returns)
                 var_y = np.var(y_true)
                 explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
                 base_logs |= {
-                    "charts/learning_rate": optimizer.param_groups[0]["lr"],
-                    "charts/entropy_coefficient": ent_coef,
-                    "losses/value_loss": v_loss.item(),
-                    "losses/policy_loss": surr_loss.item(),
-                    "losses/entropy": entropy_loss.item(),
+                    "charts/learning_rate": schedule(update),
+                    "charts/entropy_coefficient": entropy_schedule(update),
                     "losses/explained_variance": explained_var,
                     "charts/SPS": int(global_step / (time.time() - start_time)),
                 }
-                with torch.no_grad():
-                    # Log gradient norms for each parameter in shared (potentially recurrent) layer
-                    base_logs |= {
-                        f"grads/{k}_norm": v.grad.norm().item() for k, v in agent.shared.named_parameters()
-                    }
                 if args.verbose > 1:
                     print(f"Update {update} of {num_updates}")
                     print(f"SPS: {base_logs['charts/SPS']}")
-                    print(f"DiscountedReturnMean: {base_logs['charts/mean_discounted_episodic_return']}")
-            gnorm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-            optimizer.step()
-            base_logs |= {
-                "losses/grad_norm": gnorm.item(),
-            }
+                    try:
+                        print(f"DiscountedReturnMean: {base_logs['charts/mean_discounted_episodic_return']}")
+                    except KeyError: pass
             if args.tb:
                 for k, v in base_logs.items(): writer.add_scalar(k, v, global_step)
             else: wandb.log(base_logs, commit=True)
 
     print(f"PPO {vars(args)} finished")
-    try: envs.close()
-    except: pass
-    torch.cuda.empty_cache()
     if args.tb: writer.close()
     if args.track:
         wandb.finish()
