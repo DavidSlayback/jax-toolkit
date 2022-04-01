@@ -427,7 +427,6 @@ if __name__ == "__main__":
                 explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
                 base_logs |= {
                     "charts/learning_rate": schedule(update),
-                    "charts/entropy_coefficient": entropy_schedule(update),
                     "losses/explained_variance": explained_var,
                     "charts/SPS": int(global_step / (time.time() - start_time)),
                 }
