@@ -77,11 +77,18 @@ def get_gru_cls_or_fake(recurrent: bool = True, ln: bool = False, learnable: boo
             super().__init__(name=None)
             self._ln = ln
             self._linear = hk.Linear(hidden_size, True, w_init=w_i_init, b_init=b_init)
+            self.hidden_size = hidden_size
 
         def __call__(self, inputs, state):
             out = self._linear(inputs)
             if self._ln: out = hk.LayerNorm(-1, True, True)(out)
             out = jax.nn.tanh(out)
             return out, out
+
+        def initial_state(self, batch_size: Optional[int]):
+            state = jnp.zeros([self.hidden_size])
+            if batch_size is not None:
+                state = add_batch(state, batch_size)
+            return state
 
     return FakeGRU
