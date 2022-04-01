@@ -8,8 +8,8 @@ import jax.numpy as jnp
 import jax
 from ..initializers import *
 
-LN = partial(hk.LayerNorm)(-1, True, True)
-RMN = partial(hk.RMSNorm)(-1)
+LN = partial(hk.LayerNorm, -1, True, True)
+RMN = partial(hk.RMSNorm, -1)
 GRU = hk.GRU
 
 
